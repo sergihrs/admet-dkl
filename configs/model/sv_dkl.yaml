@@ -1,0 +1,23 @@
+# @package _global_
+
+model:
+  type: sv_dkl
+  hidden_dims: [512, 256]
+  use_batchnorm: true
+  dropout_rate: 0.15
+  use_residual: false
+  n_inducing: 512         # M inducing points
+
+# Additional Optuna search-space entries injected when model=sv_dkl.
+# Merged with the shared search_space in configs/config.yaml at sweep time.
+hydra:
+  sweeper:
+    search_space:
+      model.n_inducing:
+        type: categorical
+        choices: [64, 128, 256, 512, 1024]
+      train.gp_lr:
+        type: float
+        low: 1e-3
+        high: 1e-1
+        log: true

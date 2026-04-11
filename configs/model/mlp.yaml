@@ -1,0 +1,10 @@
+# @package _global_
+
+model:
+  type: mlp
+  hidden_dims: [512, 256]
+  use_batchnorm: true
+  dropout_rate: 0.15
+  use_residual: false
+  mc_samples: 30       # for MC dropout uncertainty estimation
+  n_inducing: 512      # unused by MLP; kept for sweep-schema compatibility
