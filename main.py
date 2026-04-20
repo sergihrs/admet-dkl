@@ -25,9 +25,11 @@ Example CLI invocations:
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any
@@ -168,6 +170,9 @@ def _build_model(
     """
     m = cfg.model
     hidden_dims = _parse_hidden_dims(m.hidden_dims)  # may be [] for 0-layer (linear/pure-GP)
+    print(
+        f"Building model: type={m.type}  hidden_dims={hidden_dims}  n_inducing={getattr(m, 'n_inducing', 'N/A')}"
+    )
 
     if m.type == "mlp":
         from src.models.baseline_mlp import MLPPredictor
@@ -198,6 +203,9 @@ def _build_model(
             use_batchnorm=m.use_batchnorm,
             dropout_rate=m.dropout_rate,
             use_residual=m.use_residual,
+            use_spectral_norm=bool(m.get("use_spectral_norm", False)),
+            kernel_type=str(m.get("kernel_type", "rbf")),
+            matern_nu=float(m.get("matern_nu", 2.5)),
             task=task,
             inducing_init_inputs=inducing_init_inputs,
         )
@@ -210,6 +218,84 @@ def _build_model(
 # ---------------------------------------------------------------------------
 
 
+@torch.no_grad()
+def _evaluate_split(
+    model: Any,
+    loader: DataLoader[tuple[Tensor, Tensor]],
+    *,
+    model_type: str,
+    mc_samples: int,
+    is_clf: bool,
+    device: torch.device,
+    dataset: str,
+    group: object | None = None,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Predict on a split and compute metrics + rejection-curve payload.
+
+    The primary metric is always the dataset's official TDC metric (from
+    ``bm_metric_names``). For the test split (``group`` provided) it comes
+    from ``group.evaluate()`` to match the canonical rounded benchmark
+    number; for other splits it is computed with TDC's ``Evaluator``
+    directly — ``group.evaluate(testing=False)`` is broken upstream.
+    """
+    from src.utils.metrics import (
+        area_under_rejection_curve,
+        evaluate_tdc,
+        gaussian_nll,
+        picp,
+        primary_metric_for_dataset,
+        rejection_curve,
+        tdc_evaluator_value,
+    )
+
+    model.eval()
+    mu_list, var_list, y_list = [], [], []
+    for X, y in loader:
+        X = X.to(device)
+        if model_type == "mlp":
+            mu, var = model.predict_uncertainty(X, T=mc_samples)
+        else:
+            mu, var = model.predict(X)
+        mu_list.append(mu.squeeze(-1).cpu())
+        var_list.append(var.squeeze(-1).cpu())
+        y_list.append(y)
+
+    mu_t = torch.cat(mu_list)
+    var_t = torch.cat(var_list)
+    y_t = torch.cat(y_list)
+
+    # MLP outputs raw logits for classification; convert to probabilities
+    if is_clf and model_type == "mlp":
+        mu_t = torch.sigmoid(mu_t)
+
+    metric_name = primary_metric_for_dataset(dataset)
+    if group is not None:
+        primary = evaluate_tdc(group, {dataset: mu_t.numpy()})
+    else:
+        val = tdc_evaluator_value(y_t.numpy(), mu_t.numpy(), metric_name)
+        primary = {metric_name.upper(): val}
+
+    if is_clf:
+        p = mu_t.clamp(1e-6, 1 - 1e-6)
+        nll = -(y_t * p.log() + (1 - y_t) * (1 - p).log()).mean().item()
+        cov = float("nan")
+    else:
+        nll = gaussian_nll(y_t, mu_t, var_t)
+        cov = picp(y_t, mu_t, var_t)
+
+    reject_metric = "error_rate" if is_clf else "mae"
+    fracs, vals = rejection_curve(y_t, mu_t, var_t, metric_fn=reject_metric)
+    aurc = area_under_rejection_curve(fracs, vals)
+
+    metrics = {**primary, "NLL": nll, "PICP_95": cov, "AURC": aurc}
+    rej = {
+        "metric": reject_metric,
+        "x": [float(v) for v in fracs],
+        "y": [float(v) for v in vals],
+    }
+    return metrics, rej
+
+
 def _run_train(cfg: DictConfig) -> float:
     """Full train + evaluate + report pipeline for one model/dataset.
 
@@ -217,18 +303,10 @@ def _run_train(cfg: DictConfig) -> float:
     classification) so that Optuna can minimise it when running as a sweep.
     Single runs also return this value (Hydra ignores it outside -m mode).
     """
-    from sklearn.metrics import roc_auc_score
     from tdc.benchmark_group import admet_group
 
     from src.data.tdc_datamodule import ADMETDataModule
     from src.train import train_dkl, train_mlp
-    from src.utils.metrics import (
-        area_under_rejection_curve,
-        evaluate_tdc,
-        gaussian_nll,
-        picp,
-        rejection_curve,
-    )
     from src.utils.reporting import plot_rejection_curve, plot_training_curves, save_mini_report
 
     torch.manual_seed(cfg.seed)
@@ -287,77 +365,41 @@ def _run_train(cfg: DictConfig) -> float:
 
     is_clf = task == "classification"
 
-    # 4. Compute val metric for Optuna objective (always minimize).
-    #    Regression: val MAE.  Classification: 1 - val ROC-AUC.
-    #    Cannot use group.evaluate() here — it scores against the benchmark test set.
-    model.eval()
-    val_mu_list, val_y_list = [], []
-    with torch.no_grad():
-        for X, y in loaders.val:
-            X = X.to(device)
-            if cfg.model.type == "mlp":
-                mu, _ = model.predict_uncertainty(X, T=cfg.model.mc_samples)
-                val_mu_list.append(mu.squeeze(-1).cpu())
-            else:
-                mu, _ = model.predict(X)
-                val_mu_list.append(mu.cpu())
-            val_y_list.append(y)
+    from src.utils.metrics import higher_is_better, primary_metric_for_dataset
 
-    val_mu = torch.cat(val_mu_list)
-    val_y = torch.cat(val_y_list)
+    metric_name = primary_metric_for_dataset(cfg.dataset)
+    primary_key = metric_name.upper()
+    eval_mc_samples = int(OmegaConf.select(cfg, "model.mc_samples", default=30))
 
-    if is_clf:
-        probs = torch.sigmoid(val_mu).numpy() if cfg.model.type == "mlp" else val_mu.numpy()
-        val_metric = 1.0 - float(roc_auc_score(val_y.numpy(), probs))
-    else:
-        val_metric = float((val_y - val_mu).abs().mean().item())
-    log.info("Val metric (Optuna obj, minimize): %.4f", val_metric)
-
-    # 5. Predict on test set (full T=mc_samples for MLP at evaluation time)
-    all_mu, all_var, all_y = [], [], []
-    with torch.no_grad():
-        for X, y in loaders.test:
-            X = X.to(device)
-            if cfg.model.type == "mlp":
-                mu, var = model.predict_uncertainty(X, T=cfg.model.mc_samples)
-            else:
-                mu, var = model.predict(X)
-            all_mu.append(mu.squeeze(-1).cpu())
-            all_var.append(var.squeeze(-1).cpu())
-            all_y.append(y)
-
-    mu_t = torch.cat(all_mu)
-    var_t = torch.cat(all_var)
-    y_t = torch.cat(all_y)
-
-    # MLP outputs raw logits; convert to probabilities for classification eval
-    if is_clf and cfg.model.type == "mlp":
-        mu_t = torch.sigmoid(mu_t)
-
-    # 6. TDC evaluation (primary metric: MAE or ROC-AUC)
-    tdc_metrics = evaluate_tdc(group, {cfg.dataset: mu_t.numpy()})
-
-    # 7. Uncertainty metrics (Gaussian NLL + PICP for regression; binary NLL for clf)
-    if is_clf:
-        p = mu_t.clamp(1e-6, 1 - 1e-6)
-        nll = -(y_t * p.log() + (1 - y_t) * (1 - p).log()).mean().item()
-        cov = float("nan")
-    else:
-        nll = gaussian_nll(y_t, mu_t, var_t)
-        cov = picp(y_t, mu_t, var_t)
-
-    fracs, vals = rejection_curve(
-        y_t,
-        mu_t,
-        var_t,
-        metric_fn="error_rate" if is_clf else "mae",
+    # 4. Evaluate on val (TDC Evaluator — group.evaluate(testing=False) is broken)
+    val_metrics, val_rej = _evaluate_split(
+        model,
+        loaders.val,
+        model_type=cfg.model.type,
+        mc_samples=eval_mc_samples,
+        is_clf=is_clf,
+        device=device,
+        dataset=cfg.dataset,
     )
-    aurc = area_under_rejection_curve(fracs, vals)
+    primary_val = float(val_metrics[primary_key])
+    val_objective = (1.0 - primary_val) if higher_is_better(metric_name) else primary_val
+    log.info("Val metrics: %s", val_metrics)
+    log.info("Val objective (Optuna minimize): %.4f", val_objective)
 
-    all_metrics: dict[str, float] = {**tdc_metrics, "NLL": nll, "PICP_95": cov, "AURC": aurc}
-    log.info("Metrics: %s", all_metrics)
+    # 5. Evaluate on test (TDC primary metric via group.evaluate — rounded)
+    test_metrics, test_rej = _evaluate_split(
+        model,
+        loaders.test,
+        model_type=cfg.model.type,
+        mc_samples=eval_mc_samples,
+        is_clf=is_clf,
+        device=device,
+        dataset=cfg.dataset,
+        group=group,
+    )
+    log.info("Test metrics: %s", test_metrics)
 
-    # 8. Plots — training curves include per-epoch NLL and PICP from val set
+    # 6. Plots — training curves include per-epoch NLL and PICP from val set
     plot_training_curves(
         result.train_losses,
         result.val_losses,
@@ -366,27 +408,277 @@ def _run_train(cfg: DictConfig) -> float:
         title=f"{cfg.model.type} - {cfg.dataset}",
     )
     plot_rejection_curve(
-        {cfg.model.type: (fracs, vals)},
+        {cfg.model.type: (test_rej["x"], test_rej["y"])},
         out_path=out_dir / "rejection_curve.pdf",
         ylabel="MAE" if not is_clf else "Error Rate",
         title=cfg.dataset,
+        metric_name=test_rej.get("metric"),
     )
 
-    # 9. Report — includes val_curves for per-epoch calibration history
+    # 7. Report — val_metrics + test_metrics; val_curves keep per-epoch history
     report_path = save_mini_report(
         dataset=cfg.dataset,
         model_name=cfg.model.type,
         task=task,
-        metrics=all_metrics,
+        val_metrics=val_metrics,
+        test_metrics=test_metrics,
         val_curves=result.val_metrics,
         model=model,
         runtime_seconds=result.runtime_seconds,
         config_snapshot=OmegaConf.to_container(cfg, resolve=True),  # type: ignore[arg-type]
+        rejection_curve_test=test_rej,
+        rejection_curve_val=val_rej,
         out_dir=out_dir,
     )
     log.info("Report saved to %s", report_path)
 
+    return val_objective
+
+
+# ---------------------------------------------------------------------------
+# XGBoost modes — stage 1 (single trial for Optuna) and stage 2 (ensemble)
+# ---------------------------------------------------------------------------
+
+
+def _load_xgb_splits(
+    cfg: DictConfig,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    str,
+    object,
+]:
+    """Load benchmark + in-memory arrays + infer task. Shared by stage 1/2."""
+    from tdc.benchmark_group import admet_group
+
+    from src.data.tdc_datamodule import ADMETDataModule
+    from src.train_xgb import extract_arrays
+
+    group = admet_group(path=cfg.data.tdc_group_path)
+    benchmark = group.get(cfg.dataset)
+    task = _infer_task(benchmark["train_val"]["Y"].values)
+    log.info("Dataset: %s  task: %s", cfg.dataset, task)
+
+    dm = ADMETDataModule(
+        dataset_name=cfg.dataset,
+        emb_root=cfg.data.emb_root,
+        val_fraction=cfg.data.val_fraction,
+        batch_size=cfg.data.batch_size,
+        num_workers=cfg.data.num_workers,
+        seed=cfg.seed,
+    )
+    loaders = dm.setup()
+    X_tr, y_tr = extract_arrays(loaders.train)
+    X_val, y_val = extract_arrays(loaders.val)
+    X_test, y_test = extract_arrays(loaders.test)
+    log.info(
+        "Arrays: train=%d  val=%d  test=%d  dim=%d",
+        len(X_tr),
+        len(X_val),
+        len(X_test),
+        X_tr.shape[1],
+    )
+    return X_tr, y_tr, X_val, y_val, X_test, y_test, task, group
+
+
+def _run_xgb_single(cfg: DictConfig) -> float:
+    """Stage 1: fit one XGBoost model and return the validation metric.
+
+    Used by Optuna as the sweep objective. Minimises val MAE (regression) or
+    1 - val ROC-AUC (classification).
+    """
+    from src.train_xgb import train_single_xgb
+    from src.utils.metrics import (
+        higher_is_better,
+        primary_metric_for_dataset,
+        tdc_evaluator_value,
+    )
+
+    out_dir = Path(HydraConfig.get().runtime.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    X_tr, y_tr, X_val, y_val, X_test, _y_test, task, _group = _load_xgb_splits(cfg)
+
+    res = train_single_xgb(
+        X_tr,
+        y_tr,
+        X_val,
+        y_val,
+        X_test,
+        cfg.model,
+        task,
+        int(cfg.seed),
+    )
+
+    metric_name = primary_metric_for_dataset(cfg.dataset)
+    primary_val = tdc_evaluator_value(np.asarray(y_val), np.asarray(res.val_mu), metric_name)
+    val_metric = (1.0 - primary_val) if higher_is_better(metric_name) else primary_val
+    log.info(
+        "XGB val %s=%.4f  Optuna obj=%.4f",
+        metric_name.upper(),
+        primary_val,
+        val_metric,
+    )
+
+    # Minimal per-trial record so sweep outputs stay introspectable.
+    (out_dir / "trial_summary.json").write_text(
+        json.dumps(
+            {
+                "dataset": cfg.dataset,
+                "task": task,
+                "val_metric": val_metric,
+                "n_trees": res.n_trees,
+                "runtime_seconds": round(res.runtime_seconds, 2),
+                "params": OmegaConf.to_container(cfg.model, resolve=True),
+            },
+            indent=2,
+        )
+    )
+
     return val_metric
+
+
+def _run_xgb_ensemble(cfg: DictConfig) -> None:
+    """Stage 2: train N XGBoost members and aggregate into an ensemble.
+
+    Diversity comes from per-member seeds (``cantor_pairing(cfg.seed, i)``)
+    combined with the tuned ``subsample`` / ``colsample_bytree`` knobs. The
+    ensemble mean feeds the deterministic TDC metric; the ensemble variance
+    is passed to ``gaussian_nll`` / ``picp`` / AURC as the epistemic
+    uncertainty.
+    """
+    from src.train_xgb import cantor_pairing, train_single_xgb
+    from src.utils.metrics import (
+        area_under_rejection_curve,
+        evaluate_tdc,
+        gaussian_nll,
+        picp,
+        primary_metric_for_dataset,
+        rejection_curve,
+        tdc_evaluator_value,
+    )
+    from src.utils.reporting import plot_ensemble_training_curves, plot_rejection_curve
+
+    out_dir = Path(HydraConfig.get().runtime.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    X_tr, y_tr, X_val, y_val, X_test, y_test, task, group = _load_xgb_splits(cfg)
+    is_clf = task == "classification"
+
+    n_members = int(cfg.model.n_members)
+    log.info("Training %d XGBoost ensemble members", n_members)
+
+    test_preds: list[np.ndarray] = []
+    val_preds: list[np.ndarray] = []
+    member_test_mae: list[float] = []
+    train_curves: list[list[float]] = []
+    val_curves: list[list[float]] = []
+    total_trees = 0
+    t0 = time.perf_counter()
+
+    for i in range(n_members):
+        seed_i = cantor_pairing(int(cfg.seed), i)
+        log.info("[%d/%d] seed=%d", i + 1, n_members, seed_i)
+        res = train_single_xgb(
+            X_tr,
+            y_tr,
+            X_val,
+            y_val,
+            X_test,
+            cfg.model,
+            task,
+            seed_i,
+        )
+        test_preds.append(res.test_mu)
+        val_preds.append(res.val_mu)
+        if not is_clf:
+            member_test_mae.append(float(np.abs(y_test - res.test_mu).mean()))
+        train_curves.append(res.train_curve)
+        val_curves.append(res.val_curve)
+        total_trees += res.n_trees
+
+    runtime = time.perf_counter() - t0
+
+    metric_name = primary_metric_for_dataset(cfg.dataset)
+
+    def _ensemble_metrics(
+        preds_stack: np.ndarray,
+        y_split: np.ndarray,
+        use_tdc: bool,
+    ) -> tuple[dict[str, float], dict[str, Any]]:
+        """Aggregate per-member preds into mean/var and compute the metric block."""
+        mu = preds_stack.mean(axis=0)
+        var = preds_stack.var(axis=0, ddof=0).clip(min=1e-8)
+        y_t = torch.from_numpy(y_split).float()
+        mu_t = torch.from_numpy(mu).float()
+        var_t = torch.from_numpy(var).float()
+
+        if use_tdc:
+            primary = evaluate_tdc(group, {cfg.dataset: mu})
+        else:
+            primary = {metric_name.upper(): tdc_evaluator_value(y_split, mu, metric_name)}
+
+        if is_clf:
+            p = mu_t.clamp(1e-6, 1 - 1e-6)
+            nll = -(y_t * p.log() + (1 - y_t) * (1 - p).log()).mean().item()
+            cov = float("nan")
+        else:
+            nll = gaussian_nll(y_t, mu_t, var_t)
+            cov = picp(y_t, mu_t, var_t)
+        reject_metric = "error_rate" if is_clf else "mae"
+        fracs, vals = rejection_curve(y_t, mu_t, var_t, metric_fn=reject_metric)
+        aurc = area_under_rejection_curve(fracs, vals)
+        return (
+            {**primary, "NLL": nll, "PICP_95": cov, "AURC": aurc},
+            {
+                "metric": reject_metric,
+                "x": [float(v) for v in fracs],
+                "y": [float(v) for v in vals],
+            },
+        )
+
+    val_metrics, val_rej = _ensemble_metrics(np.stack(val_preds, axis=0), y_val, use_tdc=False)
+    test_metrics, test_rej = _ensemble_metrics(np.stack(test_preds, axis=0), y_test, use_tdc=True)
+    log.info("Val metrics:  %s", val_metrics)
+    log.info("Test metrics: %s", test_metrics)
+
+    plot_ensemble_training_curves(
+        train_curves,
+        val_curves,
+        out_path=out_dir / "ensemble_training_curves.pdf",
+        title=f"xgboost ensemble - {cfg.dataset}",
+        ylabel="MAE" if not is_clf else "logloss",
+    )
+    plot_rejection_curve(
+        {"xgb_ensemble": (test_rej["x"], test_rej["y"])},
+        out_path=out_dir / "rejection_curve.pdf",
+        ylabel="MAE" if not is_clf else "Error Rate",
+        title=cfg.dataset,
+        metric_name=test_rej.get("metric"),
+    )
+
+    report = {
+        "dataset": cfg.dataset,
+        "model": "xgboost_ensemble",
+        "task": task,
+        "n_members": n_members,
+        "member_test_mae": member_test_mae,
+        "val_metrics": val_metrics,
+        "test_metrics": test_metrics,
+        "rejection_curve_test": test_rej,
+        "rejection_curve_val": val_rej,
+        "runtime_seconds": round(runtime, 2),
+        "total_trees": int(total_trees),
+        "config_snapshot": OmegaConf.to_container(cfg, resolve=True),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    report_path = out_dir / "mini_report.json"
+    report_path.write_text(json.dumps(report, indent=2))
+    log.info("Report saved to %s", report_path)
 
 
 # ---------------------------------------------------------------------------
@@ -466,15 +758,23 @@ def main(cfg: DictConfig) -> float | None:
     """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     logging.getLogger("fontTools").setLevel(logging.WARNING)
-    log.info("Config:\n%s", OmegaConf.to_yaml(cfg))
 
     if cfg.mode == "train":
+        if cfg.model.type == "xgboost":
+            return _run_xgb_single(cfg)
         return _run_train(cfg)
+    elif cfg.mode == "ensemble":
+        if cfg.model.type != "xgboost":
+            raise ValueError(
+                f"mode=ensemble is only supported for model=xgboost, got {cfg.model.type!r}"
+            )
+        _run_xgb_ensemble(cfg)
+        return None
     elif cfg.mode == "embed":
         _run_embed(cfg)
         return None
     else:
-        raise ValueError(f"Unknown mode: {cfg.mode!r}. Choose from ['train', 'embed']")
+        raise ValueError(f"Unknown mode: {cfg.mode!r}. Choose from ['train', 'ensemble', 'embed']")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from __future__ import annotations
 import gpytorch
 import torch
 from gpytorch.distributions import MultivariateNormal
-from gpytorch.kernels import RBFKernel, ScaleKernel
+from gpytorch.kernels import MaternKernel, RBFKernel, ScaleKernel
 from gpytorch.likelihoods import BernoulliLikelihood, GaussianLikelihood
 from gpytorch.means import ConstantMean
 from gpytorch.models import ApproximateGP
@@ -38,9 +38,16 @@ class DeepKernelGP(ApproximateGP):
 
     Args:
         inducing_points: Initial inducing point locations [M, feat_dim].
+        kernel_type: "rbf" (Wilson 2016 baseline) or "matern".
+        matern_nu: Matern smoothness; only used when kernel_type=="matern".
     """
 
-    def __init__(self, inducing_points: Tensor) -> None:
+    def __init__(
+        self,
+        inducing_points: Tensor,
+        kernel_type: str = "rbf",
+        matern_nu: float = 2.5,
+    ) -> None:
         variational_dist = CholeskyVariationalDistribution(
             num_inducing_points=inducing_points.shape[0]
         )
@@ -54,8 +61,16 @@ class DeepKernelGP(ApproximateGP):
         super().__init__(variational_strategy)
 
         self.mean_module = ConstantMean()
-        # ScaleKernel(RBFKernel) — standard deep-kernel baseline from Wilson 2016
-        self.covar_module = ScaleKernel(RBFKernel(ard_num_dims=inducing_points.shape[-1]))
+        ard = inducing_points.shape[-1]
+        if kernel_type == "rbf":
+            base_kernel = RBFKernel(ard_num_dims=ard)
+        elif kernel_type == "matern":
+            if matern_nu not in (0.5, 1.5, 2.5):
+                raise ValueError(f"matern_nu must be 0.5, 1.5, or 2.5 (got {matern_nu})")
+            base_kernel = MaternKernel(nu=matern_nu, ard_num_dims=ard)
+        else:
+            raise ValueError(f"Unknown kernel_type: {kernel_type!r}")
+        self.covar_module = ScaleKernel(base_kernel)
 
         # In high dimensions, tiny initial ARD lengthscales can make K(x, Z)
         # underflow to exact zeros and block gradients to the deep feature map.
@@ -97,6 +112,9 @@ class DKLModel(torch.nn.Module):
         use_batchnorm: Passed to TaskHead.
         dropout_rate: Passed to TaskHead (also used in active training mode).
         use_residual: Passed to TaskHead.
+        use_spectral_norm: Apply spectral norm to TaskHead linear layers.
+        kernel_type: Deep-kernel base kernel ("rbf" or "matern").
+        matern_nu: Matern smoothness, used only when kernel_type=="matern".
         task: "regression" or "classification".
         inducing_init_inputs: Optional raw embeddings used to initialise
             inducing points in latent feature space.
@@ -110,6 +128,9 @@ class DKLModel(torch.nn.Module):
         use_batchnorm: bool = True,
         dropout_rate: float = 0.15,
         use_residual: bool = False,
+        use_spectral_norm: bool = False,
+        kernel_type: str = "rbf",
+        matern_nu: float = 2.5,
         task: str = "regression",
         inducing_init_inputs: Tensor | None = None,
     ) -> None:
@@ -123,6 +144,7 @@ class DKLModel(torch.nn.Module):
             use_batchnorm=use_batchnorm,
             dropout_rate=dropout_rate,
             use_residual=use_residual,
+            use_spectral_norm=use_spectral_norm,
         )
 
         feat_dim = self.feature_extractor.out_dim
@@ -134,7 +156,11 @@ class DKLModel(torch.nn.Module):
             feat_dim=feat_dim,
             inducing_init_inputs=inducing_init_inputs,
         )
-        self.gp = DeepKernelGP(inducing_points)
+        self.gp = DeepKernelGP(
+            inducing_points,
+            kernel_type=kernel_type,
+            matern_nu=matern_nu,
+        )
 
         if task == "regression":
             self.likelihood: GaussianLikelihood | BernoulliLikelihood = GaussianLikelihood()

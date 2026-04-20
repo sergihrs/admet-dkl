@@ -22,6 +22,13 @@ from torch import Tensor
 # TDC-delegated metrics — flattened to a simple {METRIC: value} dict
 # ---------------------------------------------------------------------------
 
+_HIGHER_IS_BETTER = {
+    "roc-auc", "pr-auc", "spearman", "pcc", "r2",
+    "f1", "accuracy", "precision", "recall",
+    "micro-f1", "macro-f1", "kappa", "avg-roc-auc",
+}
+
+
 def evaluate_tdc(group: object, predictions: dict[str, np.ndarray]) -> dict[str, float]:
     """Delegate evaluation to the TDC benchmark group; return a flat dict.
 
@@ -42,6 +49,30 @@ def evaluate_tdc(group: object, predictions: dict[str, np.ndarray]) -> dict[str,
         for k, v in ds_metrics.items():
             flat[k.upper()] = float(v)
     return flat
+
+
+def primary_metric_for_dataset(dataset: str, group_name: str = "admet_group") -> str:
+    """Return the TDC primary metric name for a benchmark dataset.
+
+    Examples: ``"caco2_wang" -> "mae"``, ``"half_life_obach" -> "spearman"``.
+    """
+    from tdc.metadata import bm_metric_names
+
+    return str(bm_metric_names[group_name][dataset])
+
+
+def tdc_evaluator_value(
+    y_true: np.ndarray, y_pred: np.ndarray, metric_name: str
+) -> float:
+    """Score predictions with TDC's official Evaluator for a given metric."""
+    from tdc import Evaluator
+
+    return float(Evaluator(name=metric_name)(y_true, y_pred))
+
+
+def higher_is_better(metric_name: str) -> bool:
+    """True if the metric should be maximised (e.g. ROC-AUC, Spearman)."""
+    return metric_name.lower() in _HIGHER_IS_BETTER
 
 
 # ---------------------------------------------------------------------------

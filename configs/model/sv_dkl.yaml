@@ -2,22 +2,61 @@
 
 model:
   type: sv_dkl
-  hidden_dims: [512, 256]
+  hidden_dims: [2048, 1024]
   use_batchnorm: true
   dropout_rate: 0.15
   use_residual: false
-  n_inducing: 512         # M inducing points
+  use_spectral_norm: false
+  n_inducing: 256         # M inducing points
+  kernel_type: rbf        # rbf | matern
+  matern_nu: 2.5          # only used when kernel_type=matern (0.5 | 1.5 | 2.5)
 
-# Additional Optuna search-space entries injected when model=sv_dkl.
-# Merged with the shared search_space in configs/config.yaml at sweep time.
 hydra:
   sweeper:
     search_space:
-      model.n_inducing:
-        type: categorical
-        choices: [64, 128, 256, 512, 1024]
+      train.lr:
+        type: float
+        low: 1e-5
+        high: 1e-2
+        log: true
       train.gp_lr:
         type: float
         low: 1e-3
         high: 1e-1
         log: true
+      model.kernel_type:
+        type: categorical
+        choices: [rbf, matern]
+      model.matern_nu:
+        type: categorical
+        choices: [0.5, 1.5, 2.5]
+      # model.use_spectral_norm:
+      #   type: categorical
+      #   choices: [true, false]
+      model.use_batchnorm:
+        type: categorical
+        choices: [true, false]
+      model.dropout_rate:
+        type: float
+        low: 0.01
+        high: 0.5
+      model.use_residual:
+        type: categorical
+        choices: [true, false]
+      model.hidden_dims:
+        type: categorical
+        choices: [
+          "[512]",
+          "[1024]",
+          "[2048]",
+          "[256, 128]",
+          "[512, 256]",
+          "[1024, 512]",
+          "[2048, 1024]",
+          "[512, 256, 128]",
+          "[1024, 512, 256]",
+        ]
+      model.n_inducing:
+        type: categorical
+        choices: [64, 128, 256, 512, 1024]
+      

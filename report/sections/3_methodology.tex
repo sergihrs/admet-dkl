@@ -1,0 +1,30 @@
+\section{Methodology}
+
+\subsection{Dataset and Feature Extraction}
+We utilize the \texttt{caco2\_wang} regression dataset from the Therapeutics Data Commons (TDC) \cite{huang2021therapeutics}. The raw data consists of simplified molecular-input line-entry system (SMILES) strings mapped to their corresponding experimentally measured Caco-2 permeability values. 
+
+To map these discrete graph structures into a continuous vector space, we employ the pre-trained MoLFormer foundation model \cite{ross2022large}. Each SMILES string is tokenized and passed through the frozen transformer encoder, and the final hidden state of the sequence is extracted as a dense, 768-dimensional latent vector. This extraction process highlights the severe "Curse of Dimensionality" inherent to this benchmark: the training split contains merely $N \approx 582$ samples, while the feature space encompasses $P = 768$ dimensions.
+
+\subsection{Experimental Workflow and Hyperparameter Optimization}
+To ensure a rigorous, unbiased comparison, we structured our experiments into two distinct phases. All architectural tuning was conducted using the Optuna framework, employing the Tree-structured Parzen Estimator (TPE) algorithm to navigate the high-dimensional hyperparameter spaces.
+
+\textbf{Phase 1: Spectral Normalization Ablation.} Our primary objective was to empirically validate the necessity of Spectral Normalization (SN) in preventing feature collapse. We ran two massive, independent Optuna sweeps (200 trials each) for the SV-DKL architecture: one with unconstrained dense layers, and one with SN applied to the feature extractor. To guarantee robustness and account for variational noise, we aggregated the test metrics across the top-5 best-performing trials from each sweep. The hyperparameter space included the learning rate, dropout probability, the number of inducing points ($M \in [64, 512]$), and the GP kernel formulation (RBF versus Matérn with varying $\nu$ parameters). 
+
+Crucially, early stopping for all SV-DKL trials was monitored strictly via validation Negative Log-Likelihood (NLL) rather than Mean Absolute Error (MAE). Because continuous NLL can map to negative values, percentage-based relative stopping criteria are mathematically unstable. We implemented an absolute margin (\texttt{min\_delta} $= 10^{-3}$) combined with a patience window. This configuration successfully prevents stochastic noise from prematurely halting training while capturing the true global minimum before the onset of variational overfitting.
+
+\textbf{Phase 2: Probabilistic vs. Classical Benchmarking.} After confirming the optimal SV-DKL formulation (with SN), we compared its performance against a classical XGBoost Deep Ensemble. To ensure the classical baseline was pushed to its theoretical limit, we executed a separate 200-trial Optuna sweep for the XGBoost architecture. 
+
+Given the extreme $P \gg N$ regime, standard decision trees will instantly memorize the training set. Therefore, our XGBoost search space was heavily biased toward aggressive regularization. We swept over maximum tree depth (allowing stumps to prevent complex feature interactions), strict L1 and L2 regularization penalties (\texttt{reg\_alpha}, \texttt{reg\_lambda}), and harsh minimum child weight limits. Most importantly, we tuned the row and feature subsampling fractions (\texttt{subsample}, \texttt{colsample\_bytree}) to force individual trees to train on small, randomized subsets of the MoLFormer dimensions, directly generating the variance required for the ensemble's uncertainty estimation.
+
+\subsection{Evaluation Metrics}
+To holistically assess both point accuracy and the quality of the predictive distributions, models were evaluated across the following standard metrics:
+
+\begin{itemize}
+    \item \textbf{Mean Absolute Error (MAE):} The primary metric for point accuracy and the default leaderboard standard for the TDC \texttt{caco2\_wang} benchmark. For the SV-DKL model, this is evaluated using the predictive mean $\mu^*$. For the Deep Ensemble, it uses the average output across all $K$ trees.
+    
+    \item \textbf{Negative Log-Likelihood (NLL):} A strictly proper scoring rule that evaluates the entire predictive distribution. NLL heavily penalizes models that are "confidently wrong" (assigning low variance to high-error predictions) as well as overly cautious models (assigning massive variance to safe, in-distribution predictions).
+    
+    \item \textbf{Prediction Interval Coverage Probability (PICP\_95):} A direct measure of probabilistic calibration. A perfectly calibrated model should capture exactly 95\% of the true experimental values within its estimated 95\% confidence intervals ($\mu^* \pm 1.96\sigma^*$). Severe deviations below 0.95 indicate a model is dangerously overconfident.
+    
+    \item \textbf{Area Under the Rejection Curve (AURC):} The gold standard for measuring a model's ability to rank its own uncertainty and detect OOD samples. A rejection curve plots the retention fraction of the dataset (x-axis) against the corresponding subset MAE (y-axis) as the most uncertain predictions are systematically removed. A well-calibrated model will exhibit a monotonically decreasing curve (yielding a low AURC), demonstrating that discarding high-uncertainty predictions effectively eliminates the largest mathematical errors.
+\end{itemize}

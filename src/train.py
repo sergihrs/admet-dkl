@@ -306,9 +306,10 @@ def train_dkl(
 ) -> TrainResult:
     """Train SV-DKL with PredictiveLogLikelihood (ELBO) and early stopping.
 
-    Validation loss uses MSE on the predictive mean (task-agnostic, comparable
-    across seeds). Per-epoch NLL and PICP_95 are tracked separately via the
-    GP posterior predictive distribution.
+    Validation loss is the predictive NLL (used for LR scheduling, checkpointing,
+    and early stopping) to better control uncertainty calibration.
+    Per-epoch PICP_95/MAE/ROC_AUC are also tracked via the GP posterior
+    predictive distribution.
     TensorBoard events are written to out_dir/tensorboard/.
 
     Args:
@@ -340,7 +341,7 @@ def train_dkl(
         ],
     )
     scheduler = ReduceLROnPlateau(optimizer, patience=cfg.lr_patience, factor=0.5)
-    stopper = EarlyStopping(patience=cfg.patience)
+    stopper = EarlyStopping(patience=cfg.patience, min_delta=float(cfg.min_delta))
 
     ckpt_path = out_dir / "best_dkl.pt"
     result = TrainResult(best_val_loss=float("inf"), checkpoint_path=ckpt_path)
@@ -361,17 +362,11 @@ def train_dkl(
             train_loss += loss.item() * len(y)
         train_loss /= n_train
 
-        # Val loss: MSE on predictive mean (for early stopping / LR schedule)
+        # Track predictive metrics on val set and use NLL as monitored loss.
         model.eval()
         model.likelihood.eval()
-        val_loss, val_count = 0.0, 0
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            for X, y in val_loader:
-                X, y = X.to(device), y.to(device)
-                mu, _ = model.predict(X)
-                val_loss += nn.functional.mse_loss(mu, y, reduction="sum").item()
-                val_count += len(y)
-        val_loss /= val_count
+        _track_calibration_dkl(model, val_loader, device, result)
+        val_loss = result.val_metrics["NLL"][-1]
 
         scheduler.step(val_loss)
         result.train_losses.append(train_loss)
@@ -380,8 +375,7 @@ def train_dkl(
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/val", val_loss, epoch)
 
-        # Calibration curves via GP posterior (model already in eval mode)
-        _track_calibration_dkl(model, val_loader, device, result)
+        # Additional calibration curves from GP posterior.
         if "NLL" in result.val_metrics:
             writer.add_scalar("Calibration/NLL", result.val_metrics["NLL"][-1], epoch)
         if "PICP_95" in result.val_metrics:

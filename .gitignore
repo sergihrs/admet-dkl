@@ -2,6 +2,7 @@ data/
 tdc_data/
 outputs/
 tests/
+bug_tdc.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

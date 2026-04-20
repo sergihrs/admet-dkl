@@ -1,0 +1,70 @@
+# @package _global_
+
+model:
+  type: xgboost
+  # Boosting / tree params (tuned by Optuna in stage 1)
+  learning_rate: 0.01826803364907733
+  max_depth: 3
+  subsample: 0.5935231421766729
+  colsample_bytree: 0.35494917987922653
+  min_child_weight: 10
+  gamma: 0.0756321565959353
+  reg_alpha: 0.001
+  reg_lambda: 1.0
+  n_estimators: 1500
+  # Runtime
+  tree_method: hist
+  device: cuda
+  early_stopping_rounds: 50
+  # Stage-2 ensemble
+  n_members: 10
+
+# Redirect output for train/ensemble runs to:
+#   outputs/<dataset>/xgboost/<mode>/<timestamp>
+output_dir: outputs/${dataset}/${model.type}/${mode}/${now:%Y-%m-%d_%H-%M-%S}
+
+# Optuna sweep: XGB-only search space.
+hydra:
+  sweeper:
+    search_space:
+      model.learning_rate:
+        type: float
+        low: 5e-3
+        high: 5e-2
+        log: true
+      model.max_depth:
+        type: categorical
+        # Allow depth 2 (stumps). Drop 5, 6, and 7 entirely.
+        choices: [2, 3, 4]
+      model.subsample:
+        type: float
+        # Narrowing around the 0.59 winner
+        low: 0.5
+        high: 0.75
+      model.colsample_bytree:
+        type: float
+        # Shifted significantly lower. 0.1 means 76 features per tree, which is plenty!
+        low: 0.1
+        high: 0.45
+      model.min_child_weight:
+        type: int
+        # Shifted massively upward since it hit the ceiling at 10.
+        low: 8
+        high: 25
+      model.gamma:
+        type: float
+        # Winner was 0.07. No need to search up to 5.0 anymore.
+        low: 0.0
+        high: 0.5
+      model.reg_alpha:
+        type: categorical
+        # Winner was 1e-3. Bracket it.
+        choices: [1e-4, 1e-3, 1e-2]
+      model.reg_lambda:
+        type: categorical
+        # Winner was 1.0. Bracket it.
+        choices: [0.1, 1.0, 5.0]
+      model.n_estimators:
+        type: categorical
+        # Since it maxed out at 1500, give it room to build even more weak learners.
+        choices: [1000, 1500, 2000, 3000]

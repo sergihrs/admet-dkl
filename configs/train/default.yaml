@@ -2,6 +2,7 @@ max_epochs: 200
 lr: 1e-3
 gp_lr: 1e-2             # separate LR for GP
 weight_decay: 1e-4
-patience: 20            # early stopping patience (epochs)
-lr_patience: 10         # ReduceLROnPlateau patience
+patience: 10            # early stopping patience (epochs)
+min_delta: 0.01         # minimum improvement for DKL NLL-based early stopping
+lr_patience: 5         # ReduceLROnPlateau patience
 seed: 42

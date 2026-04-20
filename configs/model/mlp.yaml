@@ -8,3 +8,25 @@ model:
   use_residual: false
   mc_samples: 30       # for MC dropout uncertainty estimation
   n_inducing: 512      # unused by MLP; kept for sweep-schema compatibility
+
+hydra:
+  sweeper:
+    search_space:
+      train.lr:
+        type: float
+        low: 1e-5
+        high: 1e-2
+        log: true
+      model.use_batchnorm:
+        type: categorical
+        choices: [true, false]
+      model.dropout_rate:
+        type: float
+        low: 0.01
+        high: 0.5
+      model.use_residual:
+        type: categorical
+        choices: [true, false]
+      model.hidden_dims:
+        type: categorical
+        choices: [h512_256_128, h512_256, h512, h256, h128_64, h0, h1024_512_256, h1024_512, h512_256_256, h256_256, h128_128, h1024, h256_256_128, h128_128_64, h64_64, h64]

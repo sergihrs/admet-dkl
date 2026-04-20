@@ -1,0 +1,36 @@
+\section{Background \& Related Work}
+
+\subsection{Gaussian Processes and Deep Kernel Learning}
+Gaussian Processes (GPs) are the theoretical gold standard for Bayesian non-parametric regression and epistemic uncertainty estimation. A GP defines a prior over functions $f \sim \mathcal{GP}(m(x), k(x, x'))$, where $m(x)$ is the mean function and $k(x, x')$ is a positive-definite covariance kernel. Given a training dataset $\mathcal{D} = \{(\mathbf{X}, \mathbf{y})\}$ with $N$ observations, the GP conditions on this data to produce a predictive posterior for a new test point $x^*$. The predictive distribution is Gaussian, $y^* \sim \mathcal{N}(\mu^*, \Sigma^*)$, with the exact mean and variance given by:
+\begin{align}
+    \mu^* &= \mathbf{K}_{*N} (\mathbf{K}_{NN} + \sigma^2 \mathbf{I})^{-1} \mathbf{y} \\
+    \Sigma^* &= \mathbf{K}_{**} - \mathbf{K}_{*N} (\mathbf{K}_{NN} + \sigma^2 \mathbf{I})^{-1} \mathbf{K}_{N*}
+\end{align}
+where $\mathbf{K}_{NN}$ is the $N \times N$ covariance matrix of the training data. This formulation is highly advantageous for low-data regimes: the model natively interpolates based on structural distance, and the predictive variance $\Sigma^*$ naturally increases as $x^*$ moves further away from the training distribution (OOD).
+
+However, standard GPs suffer from two critical limitations. First, traditional distance-based kernels (e.g., RBF or Matérn) degrade in high-dimensional spaces due to the curse of dimensionality. Deep Kernel Learning (DKL) solves this by projecting the inputs through a deep neural network feature extractor $f_\theta(x)$ before applying the base kernel: $k_{DKL}(x, x') = k(f_\theta(x), f_\theta(x'))$ \cite{wilson2016deep}. 
+
+Second, the exact GP posterior requires computing the inverse of the dense matrix $(\mathbf{K}_{NN} + \sigma^2 \mathbf{I})^{-1}$. This operation imposes a computational bottleneck of $\mathcal{O}(N^3)$ in time and $\mathcal{O}(N^2)$ in memory, strictly prohibiting the use of exact GPs on modern deep learning architectures and large datasets.
+
+\subsection{Stochastic Variational DKL (SV-DKL) and Inducing Points}
+To bypass the $\mathcal{O}(N^3)$ bottleneck, Stochastic Variational Deep Kernel Learning (SV-DKL) utilizes sparse approximations via inducing points \cite{wilson2016stochastic}. Instead of computing the exact covariance between every pair of the $N$ training points, the model introduces a small set of $M$ trainable pseudo-inputs, $Z = \{z_1, \dots, z_M\}$, where $M \ll N$.
+
+Intuitively, these inducing points act as representational "hubs" in the latent space. Rather than forcing every data point to directly compute its distance to every other data point (requiring an $N \times N$ graph), all $N$ data points calculate their covariance relative to the $M$ hubs. The model then approximates the true posterior by optimizing a variational distribution $q(f, u)$ through the maximization of the Evidence Lower Bound (ELBO):
+\begin{equation}
+    \mathcal{L}_{ELBO} = \mathbb{E}_{q(f)}[\log p(\mathbf{y}|f)] - \text{KL}[q(u) \parallel p(u)]
+\end{equation}
+By routing the covariance calculations through these sparse hubs, the matrix inversion bottleneck is reduced from $\mathcal{O}(N^3)$ to $\mathcal{O}(M^3)$. Crucially, this decouples the computational cost from the dataset size $N$, allowing the GP parameters and the deep feature extractor $f_\theta$ to be trained jointly using mini-batch stochastic gradient descent (SGD).
+
+\subsection{The Feature Collapse Problem \& Spectral Normalization}
+While DKL provides scalability, decoupling representation learning from probabilistic inference introduces a severe vulnerability known as \textit{Feature Collapse} \cite{vanamersfoort2021feature}. Because the deep feature extractor $f_\theta(x)$ is parameterized as an unconstrained Multi-Layer Perceptron (MLP), it optimizes purely to maximize the ELBO on the training set. 
+
+During this optimization, the MLP can learn a highly distorted, non-linear mapping that aggressively squashes the latent space. When presented with an OOD molecule, the unconstrained network may arbitrarily project it directly into a dense cluster of training points in the latent space. The GP layer, which only evaluates distance based on the extracted features, is mathematically "tricked" into perceiving the OOD molecule as highly familiar, resulting in a confident but entirely erroneous prediction.
+
+To restore true epistemic uncertainty, the mapping $f_\theta$ must satisfy a bi-Lipschitz constraint, ensuring that structural distances in the original input space are proportionally preserved in the latent space. Following recent probabilistic literature, we enforce this by applying Spectral Normalization (SN) to the dense layers of the DKL feature extractor. By strictly bounding the largest singular value (the spectral norm, $\|W\|_2 \le 1$) of each weight matrix, we constrain the Lipschitz constant of the network, preserving distance awareness and preventing the collapse of OOD samples.
+
+\subsection{Classical Baselines and Deep Ensembles}
+Despite the theoretical elegance of Bayesian methods, classical tree-based models, such as XGBoost \cite{chen2016xgboost}, remain the empirical state-of-the-art for many tabular and chemoinformatic predictive tasks due to their speed, robustness to mixed feature types, and resistance to scaling artifacts. However, standard decision trees are deterministic and lack a native formulation for estimating continuous epistemic uncertainty.
+
+While standard neural networks frequently utilize Monte Carlo (MC) Dropout or computationally expensive Bayesian Neural Networks (BNNs) to approximate predictive variance, these methods are incompatible with tree boosting. For decision trees, the most mathematically robust proxy for uncertainty is the Deep Ensemble \cite{lakshminarayanan2017simple}. 
+
+By training $K$ independent XGBoost regressors, we force architectural diversity through aggressive stochasticity: each member is initialized with a different random seed and trained on distinct subsets of the data via bootstrap aggregating (row \texttt{subsample}) and feature masking (\texttt{colsample\_bytree}). For a given test molecule, the ensemble generates a distribution of $K$ predictions. The predictive mean serves as the point estimate, while the variance across the independent ensemble members explicitly quantifies the model's epistemic uncertainty—yielding high variance when the diverse trees disagree on an unfamiliar OOD region of the feature space.

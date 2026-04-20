@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.nn.utils.parametrizations import spectral_norm
 
 
 class TaskHead(nn.Module):
@@ -31,6 +32,7 @@ class TaskHead(nn.Module):
         use_batchnorm: Whether to insert BatchNorm1d after each linear layer.
         dropout_rate: Dropout probability applied after each hidden block.
         use_residual: Add residual (skip) connections where dimensions match.
+        use_spectral_norm: Wrap each Linear with spectral normalization.
     """
 
     def __init__(
@@ -40,6 +42,7 @@ class TaskHead(nn.Module):
         use_batchnorm: bool = True,
         dropout_rate: float = 0.15,
         use_residual: bool = False,
+        use_spectral_norm: bool = False,
     ) -> None:
         super().__init__()
         self.use_residual = use_residual
@@ -47,7 +50,10 @@ class TaskHead(nn.Module):
 
         dims = [input_dim, *hidden_dims]
         for in_d, out_d in zip(dims[:-1], dims[1:]):
-            block: list[nn.Module] = [nn.Linear(in_d, out_d)]
+            linear = nn.Linear(in_d, out_d)
+            if use_spectral_norm:
+                spectral_norm(linear)
+            block: list[nn.Module] = [linear]
             if use_batchnorm:
                 block.append(nn.BatchNorm1d(out_d))
             block.append(nn.ReLU())
@@ -98,6 +104,7 @@ class MLPPredictor(nn.Module):
         use_batchnorm: bool = True,
         dropout_rate: float = 0.15,
         use_residual: bool = False,
+        use_spectral_norm: bool = False,
     ) -> None:
         super().__init__()
         self.feature_extractor = TaskHead(
@@ -106,8 +113,11 @@ class MLPPredictor(nn.Module):
             use_batchnorm=use_batchnorm,
             dropout_rate=dropout_rate,
             use_residual=use_residual,
+            use_spectral_norm=use_spectral_norm,
         )
         self.head = nn.Linear(self.feature_extractor.out_dim, output_dim)
+        if use_spectral_norm:
+            spectral_norm(self.head)
 
     def forward(self, x: Tensor) -> Tensor:
         """Single deterministic forward pass.
