@@ -30,7 +30,7 @@ This qualitative difference is starkly visualized in the Rejection Curves (Figur
     \label{fig:rejection_curve}
 \end{figure}
 
-\subsection{SV-DKL vs. XGBoost: Overcoming the Geometric Mismatch}
+\subsection{SV-DKL vs. XGBoost: Overcoming the Mismatch in Inductive Biases}
 In Phase 2, we benchmarked our optimal SV-DKL model against a classical XGBoost Deep Ensemble. Despite an exhaustive 200-trial hyperparameter sweep pushing tree parameters to their theoretical limits of regularization (e.g., highly constrained tree depth, massive estimator counts, and aggressive feature subsampling to combat the $P \gg N$ regime), the optimal XGBoost model failed to match the fully tuned SV-DKL architecture.
 
 \begin{table}[h]
@@ -49,13 +49,13 @@ AURC $\downarrow$ & 0.357 & \textbf{0.299} \\ \bottomrule
 
 The probabilistic failure of the XGBoost ensemble is absolute. An NLL of 39.627 and a collapsed coverage probability of 20.9\% (PICP\_95) highlights the architecture's inability to quantify continuous uncertainty in low-data regimes. Because the $N \approx 582$ training set is so sparse, the independent members of the ensemble ultimately converge on very similar axis-aligned splits. This lack of architectural diversity results in pathologically narrow predictive intervals (variance collapse). When the ensemble inevitably makes an error with a near-zero predicted variance, the Gaussian NLL penalty explodes exponentially, rendering the model a "confident fool."
 
-Furthermore, the point accuracy gap (MAE of 0.373 vs 0.358) exposes a fundamental \textit{Geometric Mismatch}. Decision trees rely on orthogonal, axis-aligned hyper-rectangular partitions. When forced to segment the continuous, highly distributed latent space of a MoLFormer embedding, trees must build highly inefficient, jagged approximations of smooth decision boundaries. If the trees are allowed to grow deep enough to approximate these curves, they instantly memorize the tiny training set. If they are constrained to prevent overfitting (as enforced by our Optuna sweep), they underfit the underlying molecular relationships. 
+Furthermore, the point accuracy gap (MAE of 0.373 vs 0.358) exposes a fundamental \textit{mismatch in inductive biases}. Decision trees rely on orthogonal, axis-aligned hyper-rectangular partitions. When forced to segment the continuous, highly distributed latent space of a MoLFormer embedding, trees must build highly inefficient, jagged approximations of smooth decision boundaries. If the trees are allowed to grow deep enough to approximate these curves, they instantly memorize the tiny training set. If they are constrained to prevent overfitting (as enforced by our Optuna sweep), they underfit the underlying molecular relationships. 
 
 Conversely, the SV-DKL natively utilizes spatial covariance metrics (via the GP Kernel) across the entire 768-dimensional vector simultaneously. By evaluating holistic Euclidean or Mahalanobis distances rather than slicing individual axes, SV-DKL naturally exploits the foundation model's dense geometry exactly as it was designed to be interpreted.
 
 \begin{figure}[h]
     \centering
     \includegraphics[width=0.5\linewidth]{figures/ensemble-training-curves.pdf}
-    \caption{Training vs. Validation MAE per epoch for the XGBoost ensemble. The plot illustrates the struggle with the geometric mismatch: tree-based models rapidly memorize the small $N$ training set, while generalization on the validation set severely plateaus despite extreme regularization.}
+    \caption{Training vs. Validation MAE per epoch for the XGBoost ensemble. The plot illustrates the struggle with this mismatch in inductive biases: tree-based models rapidly memorize the small $N$ training set, while generalization on the validation set severely plateaus despite extreme regularization.}
     \label{fig:training_curves}
 \end{figure}
