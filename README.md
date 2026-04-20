@@ -24,14 +24,18 @@ SV-DKL with Spectral Normalization significantly outperforms XGBoost Deep Ensemb
 | **SV-DKL (No Spectral Norm)** | 0.404 | 0.753 | 91.53% | 0.369 |
 | **SV-DKL (With Spectral Norm)** | **0.358** | **0.652** | **98.35%** | **0.299** |
 
+---
 
-![Rejection Curve Comparison](report/figures/spectral-norm-rc-comparison.pdf)
+<img src="report/figures/spectral-norm-rc-comparison.png" alt="Rejection Curve Comparison" width="70%">
+
 **Figure 1:** The Rejection Curve comparison shows that Spectral Normalization "straightens" the rejection curve, indicating that the model properly ranks predictive uncertainty and assigns higher variance to incorrect predictions.
 
-![XGBoost Overfitting](report/figures/ensemble-training-curves.pdf)
+<img src="report/figures/ensemble-training-curves.png" alt="XGBoost Overfitting" width="70%">
+
 **Figure 2:** XGBoost quickly memorizes the training set but generalizes poorly, highlighting the structural limitations of tree models on dense high-dimensional graphs compared to regularized SV-DKL.
 
-![DKL vs XGBoost Rejection Curves](report/figures/dkl-vs-xg-rc.pdf)
+<img src="report/figures/dkl-vs-xg-rc.png" alt="DKL vs XGBoost Rejection Curves" width="70%">
+
 **Figure 3:** SV-DKL with Spectral Normalization achieves a much steeper rejection curve compared to XGBoost, demonstrating superior uncertainty ranking and OOD detection capabilities.
 
 ## Repository Structure
